@@ -9,21 +9,27 @@ jobs:
     runs-on: macos-15
 
     steps:
-      - name: Checkout
+      # 1. 下载 RustDesk 1.4.9 源码
+      - name: Checkout RustDesk
         uses: actions/checkout@v4
         with:
+          repository: rustdesk/rustdesk
+          ref: 1.4.9
           fetch-depth: 0
           submodules: recursive
 
+      # 2. 安装 Rust
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # 3. 安装 Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
+      # 4. 查看编译环境
       - name: Show versions
         run: |
           rustc --version
@@ -31,29 +37,35 @@ jobs:
           flutter --version
           xcodebuild -version
 
+      # 5. 安装基础依赖
       - name: Install dependencies
         run: |
           brew update
           brew install create-dmg
 
+      # 6. 获取 Flutter 依赖
       - name: Flutter dependencies
         working-directory: flutter
         run: |
           flutter pub get
 
-      - name: Build RustDesk
+      # 7. 编译 Rust
+      - name: Build Rust
         run: |
           cargo build --locked --release
 
+      # 8. 编译 macOS App
       - name: Build Flutter macOS
         working-directory: flutter
         run: |
           flutter build macos --release
 
+      # 9. 查看生成结果
       - name: Show build result
         run: |
           ls -lah flutter/build/macos/Build/Products/Release/
 
+      # 10. 上传 RustDesk.app
       - name: Upload macOS app
         uses: actions/upload-artifact@v4
         with:
