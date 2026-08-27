@@ -1,1 +1,62 @@
+name: Build RustDesk macOS
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    name: Build macOS
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show versions
+        run: |
+          rustc --version
+          cargo --version
+          flutter --version
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install create-dmg
+
+      - name: Flutter dependencies
+        working-directory: flutter
+        run: |
+          flutter pub get
+
+      - name: Build RustDesk
+        run: |
+          cargo build --locked --release
+
+      - name: Build Flutter macOS
+        working-directory: flutter
+        run: |
+          flutter build macos --release
+
+      - name: Show build result
+        run: |
+          ls -lah flutter/build/macos/Build/Products/Release/
+
+      - name: Upload macOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: XSDMUSIC-RustDesk-macos
+          path: flutter/build/macos/Build/Products/Release/RustDesk.app
+          if-no-files-found: error
