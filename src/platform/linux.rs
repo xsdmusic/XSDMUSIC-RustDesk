@@ -1,6 +1,6 @@
 use super::{gtk_sudo, CursorData, ResultType};
 use desktop::Desktop;
-pub use hbb_common::platform::linux::*;
+pub use base::platform::linux::*;
 
 #[cfg(feature = "drm")]
 pub fn dispatch_wayland_display_probe() {
@@ -17,10 +17,10 @@ use hbb_common::{
     config::Config,
     libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void},
     log,
-    message_proto::{DisplayInfo, Resolution},
     regex::{Captures, Regex},
     users::{get_user_by_name, os::unix::UserExt},
 };
+use base::message_proto::{DisplayInfo, Resolution};
 use libxdo_sys::{self, xdo_t, Window};
 use std::{
     cell::RefCell,
@@ -64,7 +64,7 @@ lazy_static::lazy_static! {
     /// serve but the DRM path can. Unmemoised lookup on purpose: this may run mid-boot, and
     /// a "no" cached that early would be wrong for the rest of the process.
     pub static ref IS_X11: bool = {
-        let x11 = hbb_common::platform::linux::is_x11_or_headless();
+        let x11 = base::platform::linux::is_x11_or_headless();
         #[cfg(feature = "drm")]
         {
             if x11 && !display_server_forced() && is_login_screen_wayland() {
@@ -251,19 +251,6 @@ mod gnome_monitor_layout_tests {
             Some(GnomeMonitorLayoutMode::Logical)
         );
     }
-
-    #[test]
-    fn maps_physical_layout() {
-        assert_eq!(
-            gnome_monitor_layout_mode_from_value(2),
-            Some(GnomeMonitorLayoutMode::Physical)
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_layout() {
-        assert_eq!(gnome_monitor_layout_mode_from_value(4), None);
-    }
 }
 
 #[inline]
@@ -300,6 +287,35 @@ thread_local! {
         xdo
     });
     static DISPLAY: RefCell<*mut c_void> = RefCell::new(unsafe { XOpenDisplay(std::ptr::null())});
+}
+
+pub fn right_alt_is_level3_shift() -> ResultType<bool> {
+    use hbb_common::x11::{keysym, xlib};
+    const XKB_USE_CORE_KBD: c_uint = 0x0100;
+    // A fresh connection avoids Xlib's stale keymap cache after a layout switch.
+    // This query runs only for a matched chord with physical Right Alt held.
+    let display = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
+    if display.is_null() {
+        bail!("X display unavailable");
+    }
+    let result = (|| {
+        let code = rdev::linux_keycode_from_key(rdev::Key::AltGr)
+            .ok_or_else(|| anyhow!("Right Alt has no X keycode"))?;
+        let mut state: xlib::XkbStateRec = unsafe { std::mem::zeroed() };
+        let status = unsafe { xlib::XkbGetState(display, XKB_USE_CORE_KBD, &mut state) };
+        if status != c_int::from(xlib::Success) {
+            bail!("XkbGetState failed: {}", status);
+        }
+        let symbol = unsafe {
+            xlib::XkbKeycodeToKeysym(display, code as _, state.group.into(), 0)
+        };
+        // Physical Right Alt is ordinary Alt on layouts such as US English.
+        Ok(matches!(symbol as u32, keysym::XK_ISO_Level3_Shift
+            | keysym::XK_ISO_Level3_Latch | keysym::XK_ISO_Level3_Lock
+            | keysym::XK_Mode_switch))
+    })();
+    unsafe { xlib::XCloseDisplay(display) };
+    result
 }
 
 // X11 error event structure for the custom error handler.
@@ -375,8 +391,113 @@ pub struct xcb_xfixes_get_cursor_image {
 
 #[inline]
 pub fn is_login_screen_wayland() -> bool {
-    let values = get_values_of_seat0_with_gdm_wayland(&[0, 2]);
+    let values = get_values_of_seat0_with_gdm_wayland(&[0, 2, 1]);
+    #[cfg(feature = "drm")]
+    if is_wayland_tty_greeter(&values[0], &values[2]) {
+        return true;
+    }
     is_gdm_user(&values[1]) && get_display_server_of_session(&values[0]) == DISPLAY_SERVER_WAYLAND
+}
+
+/// greetd starts its greeter with no `XDG_SESSION_TYPE`, so logind records the session as
+/// `Type=tty` whatever the greeter draws with, and the display server then reads as x11. A greeter
+/// whose user has a compositor socket is a Wayland login screen all the same (cosmic-greeter,
+/// gtkgreet, ReGreet, ...); a console greeter (tuigreet, agreety) has none and is left as it was.
+/// A display server forced to x11 keeps the greeter on the x11 path, as `adopt_wayland_tty_greeter`
+/// does, so the login gate does not refuse a greeter the service serves over X11.
+#[cfg(feature = "drm")]
+fn is_wayland_tty_greeter(sid: &str, uid: &str) -> bool {
+    std::env::var("RUSTDESK_FORCED_DISPLAY_SERVER").as_deref() != Ok(DISPLAY_SERVER_X11)
+        && has_wayland_socket(uid)
+        && is_tty_greeter_session(sid)
+}
+
+#[cfg(feature = "drm")]
+fn is_tty_greeter_session(sid: &str) -> bool {
+    if sid.is_empty() {
+        return false;
+    }
+    let failure = match Command::new(CMD_LOGINCTL.as_str())
+        .args(["show-session", "-p", "Class", "-p", "Type", sid])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            return is_tty_greeter_props(&String::from_utf8_lossy(&output.stdout));
+        }
+        Ok(output) => output.status.to_string(),
+        Err(err) => err.to_string(),
+    };
+    hbb_common::throttled_log!(
+        Duration::from_secs(60),
+        info,
+        "loginctl show-session {sid} failed ({failure}); not taken for a greetd greeter"
+    );
+    false
+}
+
+#[cfg(any(feature = "drm", test))]
+fn is_tty_greeter_props(props: &str) -> bool {
+    let has = |prop: &str| props.lines().any(|line| line.trim() == prop);
+    has("Class=greeter") && has("Type=tty")
+}
+
+/// Derived from the uid, not `XDG_RUNTIME_DIR`: the root service is given no such variable.
+#[cfg(feature = "drm")]
+fn has_wayland_socket(uid: &str) -> bool {
+    !uid.is_empty()
+        && uid.bytes().all(|b| b.is_ascii_digit())
+        && dir_has_wayland_socket(Path::new(&format!("/run/user/{uid}")))
+}
+
+#[cfg(any(feature = "drm", test))]
+fn dir_has_wayland_socket(dir: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Expected until logind has created the runtime directory.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(err) => {
+            hbb_common::throttled_log!(
+                Duration::from_secs(60),
+                info,
+                "Could not read {}: {err}; not taken for a greetd greeter",
+                dir.display()
+            );
+            return false;
+        }
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("wayland-")
+            && !name.ends_with(".lock")
+            && entry.file_type().map_or(false, |t| t.is_socket())
+    })
+}
+
+#[cfg(test)]
+mod tty_greeter_tests {
+    use super::*;
+
+    #[test]
+    fn a_greetd_greeter_running_a_compositor_is_a_wayland_login_screen() {
+        // What `loginctl show-session -p Class -p Type` prints for cosmic-greeter under greetd.
+        assert!(is_tty_greeter_props("Type=tty\nClass=greeter\n"));
+        assert!(!is_tty_greeter_props("Type=tty\nClass=user\n"));
+        assert!(!is_tty_greeter_props("Type=wayland\nClass=greeter\n"));
+
+        let dir = std::env::temp_dir().join(format!("rustdesk-tty-greeter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wayland-1.lock"), b"").unwrap();
+        assert!(
+            !dir_has_wayland_socket(&dir),
+            "a console greeter runs no compositor"
+        );
+        let _listener = std::os::unix::net::UnixListener::bind(dir.join("wayland-1")).unwrap();
+        assert!(dir_has_wayland_socket(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// An explicit `RUSTDESK_FORCED_DISPLAY_SERVER` is an operator override, and the root service
@@ -875,6 +996,43 @@ fn get_all_term_values(uid: &str) -> Vec<String> {
     terms
 }
 
+fn append_audio_latency_envs(
+    envs: &mut Vec<(&'static str, String)>,
+    get_var: impl Fn(&str) -> Option<String>,
+) {
+    for key in ["PULSE_LATENCY_MSEC", "PIPEWIRE_LATENCY"] {
+        if let Some(value) = get_var(key).filter(|value| !value.is_empty()) {
+            envs.push((key, value));
+        }
+    }
+}
+
+#[cfg(test)]
+mod audio_latency_env_tests {
+    use super::append_audio_latency_envs;
+
+    #[test]
+    fn forwards_configured_values_without_creating_defaults() {
+        let mut envs = Vec::new();
+        append_audio_latency_envs(&mut envs, |key| match key {
+            "PULSE_LATENCY_MSEC" => Some("60".to_owned()),
+            "PIPEWIRE_LATENCY" => Some("1024/48000".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            envs,
+            vec![
+                ("PULSE_LATENCY_MSEC", "60".to_owned()),
+                ("PIPEWIRE_LATENCY", "1024/48000".to_owned()),
+            ]
+        );
+
+        envs.clear();
+        append_audio_latency_envs(&mut envs, |_| None);
+        assert!(envs.is_empty());
+    }
+}
+
 #[inline]
 fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
     match desktop {
@@ -905,6 +1063,9 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
                     ));
                 }
             }
+
+            append_audio_latency_envs(&mut envs, |key| std::env::var(key).ok());
+
             envs.push((
                 "TERM",
                 get_cur_term(&desktop.uid).unwrap_or_else(|| suggest_best_term()),
@@ -1136,10 +1297,10 @@ pub fn start_os_service() {
                 // Run the login-screen --server as the active seat0 session user (the greeter
                 // account) rather than root, so the DRM capture GPU/EGL convert never loads the
                 // vendor GPU userspace in a privileged process. is_login_wayland() matches a GDM or
-                // SDDM Wayland greeter (is_gdm_user covers both), and desktop.uid is that greeter's
-                // uid, so this drops to whichever greeter owns seat0. A greeter is_gdm_user does not
-                // recognize (e.g. LightDM) never reaches this branch -- it takes the unprivileged
-                // else-branch below already. A genuine root graphical session (username=="root")
+                // SDDM Wayland greeter (is_gdm_user covers both) or a greetd one (tty_greeter), and
+                // desktop.uid is that greeter's uid, so this drops to whichever greeter owns seat0.
+                // A greeter neither recognizes (e.g. LightDM) never reaches this branch -- it takes
+                // the unprivileged else-branch below already. A genuine root graphical session (username=="root")
                 // has no lower uid to drop to, so it stays root. The whole branch is gated on the drm
                 // feature, so the drm-off build is upstream's single `start_server(None, ..)` line.
                 #[cfg(not(feature = "drm"))]
@@ -1254,24 +1415,24 @@ pub fn get_active_userid_cached() -> Option<u32> {
 }
 
 fn get_cm() -> bool {
-    // We use `CMD_PS` instead of `ps` to suppress some audit messages on some systems.
-    if let Ok(output) = Command::new(CMD_PS.as_str()).args(vec!["aux"]).output() {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if line.contains(&format!(
-                "{} --cm",
-                std::env::current_exe()
-                    .unwrap_or("".into())
-                    .to_string_lossy()
-            )) {
-                return true;
-            }
-        }
-    }
-    false
+    // Runs twice a second in the service loop, so walk /proc rather than forking `ps aux`; that
+    // fork is also what the `CMD_PS` audit-message workaround this replaces was for.
+    let cm = format!(
+        "{} --cm",
+        std::env::current_exe()
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+    any_process(None, "cmdline", |cmdline| cmdline.contains(&cm))
 }
 
 pub fn is_login_wayland() -> bool {
-    let files = ["/etc/gdm3/custom.conf", "/etc/gdm/custom.conf"];
+    // Debian's gdm3 reads /etc/gdm3/daemon.conf instead of custom.conf.
+    let files = [
+        "/etc/gdm3/custom.conf",
+        "/etc/gdm/custom.conf",
+        "/etc/gdm3/daemon.conf",
+    ];
     match (
         Regex::new(r"# *WaylandEnable *= *false"),
         Regex::new(r"WaylandEnable *= *true"),
@@ -1307,6 +1468,11 @@ fn _get_display_manager() -> String {
 /// Returns the cached active username when available.
 /// Callers that require a fresh seat0 lookup should call `get_values_of_seat0` directly.
 pub fn get_active_username() -> String {
+    // Flatpak runs only inside the logged-in user's session, and Flathub builds
+    // cannot reach the host's loginctl.
+    if is_flatpak() {
+        return crate::username();
+    }
     if let Some((_, username)) = get_active_user_id_name_from_cache() {
         return username;
     }
@@ -1363,7 +1529,17 @@ pub fn is_prelogin() -> bool {
     }
     let name = get_active_username();
     if let Ok(res) = run_cmds(&format!("getent passwd {}", name)) {
-        return res.contains("/bin/false") || res.contains("/usr/sbin/nologin");
+        return res.lines().any(|entry| {
+            let shell = entry.trim().rsplit(':').next().unwrap_or_default();
+            matches!(
+                shell,
+                "/bin/false"
+                    | "/usr/bin/false"
+                    | "/usr/sbin/nologin"
+                    | "/sbin/nologin"
+                    | "/usr/bin/nologin"
+            )
+        });
     }
     false
 }
@@ -1479,12 +1655,58 @@ where
 }
 
 pub fn get_pa_monitor() -> String {
+    if let Some(monitor) = get_default_pa_monitor() {
+        return monitor;
+    }
     get_pa_sources()
         .drain(..)
         .map(|x| x.0)
         .filter(|x| x.contains("monitor"))
         .next()
         .unwrap_or("".to_owned())
+}
+
+// The first monitor in the source list can belong to an output the desktop does not play to.
+fn get_default_pa_monitor() -> Option<String> {
+    use pulsectl::controllers::*;
+    // The audio service retries about every second while PulseAudio is unavailable.
+    const LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut handler = SinkController::create()
+        .map_err(|err| {
+            hbb_common::throttled_log!(
+                LOG_INTERVAL,
+                warn,
+                "Failed to create SinkController: {:?}",
+                err
+            )
+        })
+        .ok()?;
+    let sink = handler
+        .get_server_info()
+        .map_err(|err| {
+            hbb_common::throttled_log!(
+                LOG_INTERVAL,
+                warn,
+                "Failed to get the PulseAudio server info: {:?}",
+                err
+            )
+        })
+        .ok()?
+        .default_sink_name?;
+    handler
+        .get_device_by_name(&sink)
+        .map_err(|err| {
+            hbb_common::throttled_log!(
+                LOG_INTERVAL,
+                warn,
+                "Failed to get the default sink {}: {:?}",
+                sink,
+                err
+            )
+        })
+        .ok()?
+        .monitor_name
+        .filter(|name| !name.is_empty())
 }
 
 pub fn get_pa_source_name(desc: &str) -> String {
@@ -1576,6 +1798,34 @@ fn get_envs<'a>(
     process_pat: &str,
     names: &[&'a str],
 ) -> std::collections::HashMap<&'a str, String> {
+    get_envs_where(uid, process_pat, names, false, |count| count == names.len())
+}
+
+/// The newest process matching `process_pat`, whatever it happens to carry: the semantics of the
+/// `ps -u <uid> -f | grep <pat> | tail -1` pipeline the callers below used before. A variable this
+/// process does not have means moving on to the next pattern, never on to an older process that
+/// may belong to a session which has since logged out.
+fn get_envs_of_newest<'a>(
+    uid: &str,
+    process_pat: &str,
+    names: &[&'a str],
+) -> std::collections::HashMap<&'a str, String> {
+    get_envs_where(uid, process_pat, names, true, |_| true)
+}
+
+/// `get_envs` with the caller's own process order and its own notion of a complete answer, told
+/// how many of `names` the process carries: the first process `accept` takes wins outright, and
+/// the count-based ranking is only the fallback for when no process is accepted at all.
+fn get_envs_where<'a, F>(
+    uid: &str,
+    process_pat: &str,
+    names: &[&'a str],
+    newest_first: bool,
+    mut accept: F,
+) -> std::collections::HashMap<&'a str, String>
+where
+    F: FnMut(usize) -> bool,
+{
     // The tie-breaking logic uses a u64 bitmask, limiting us to 64 variables.
     debug_assert!(
         names.len() <= 64,
@@ -1602,21 +1852,24 @@ fn get_envs<'a>(
     let mut best_count = 0usize;
     let mut best_mask: u64 = 0;
 
-    // Iterate /proc to find matching processes
+    // Iterate /proc to find matching processes. `newest_first` is only for `get_envs_of_newest`,
+    // whose callers need the last PID-ordered match their `ps ... | tail -1` pipelines took;
+    // without it the order is whatever readdir returns, which is what `get_envs` has always used.
+    // Neither order identifies the active session -- a user with two live graphical sessions has
+    // one of each, and picking by PID guesses. See `Desktop::refresh` for who owns that question.
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return best;
     };
+    let mut pids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .collect();
+    if newest_first {
+        pids.sort_unstable_by(|a, b| b.cmp(a));
+    }
 
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(pid_str) = file_name.to_str() else {
-            continue;
-        };
-        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-
-        let proc_path = entry.path();
+    for pid in pids {
+        let proc_path = std::path::Path::new("/proc").join(pid.to_string());
 
         // Check if process belongs to the specified uid
         if let Ok(meta) = std::fs::metadata(&proc_path) {
@@ -1634,15 +1887,18 @@ fn get_envs<'a>(
             continue;
         };
         let cmdline_str = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-        if !re.is_match(&cmdline_str) {
+        // The `grep -v 'grep'` of the pipeline this replaces. A user grepping for one of these
+        // patterns is otherwise the newest match for it, and answers with whatever environment
+        // their shell had -- an X forwarding endpoint over ssh, say.
+        if cmdline_str.contains("grep") || !re.is_match(&cmdline_str) {
             continue;
         }
 
-        // Read environ and extract matching variables
-        let environ_path = proc_path.join("environ");
-        let Ok(environ) = std::fs::read(&environ_path) else {
-            continue;
-        };
+        // Read environ and extract matching variables. A read that fails -- the process exited
+        // between these two reads -- is a process carrying none of `names`, not a process to
+        // skip: skipping it would hand `newest_first` on to an older PID, where the pipeline
+        // this replaces stopped at the single PID its `tail -1` had already picked.
+        let environ = std::fs::read(proc_path.join("environ")).unwrap_or_default();
 
         let mut found = empty.clone();
         let mut found_count = 0usize;
@@ -1673,12 +1929,12 @@ fn get_envs<'a>(
                             found_mask |= bit;
                         }
                     }
-
-                    if found_count == names.len() {
-                        return found;
-                    }
                 }
             }
+        }
+
+        if accept(found_count) {
+            return found;
         }
 
         if found_count > best_count || (found_count == best_count && found_mask > best_mask) {
@@ -1691,29 +1947,37 @@ fn get_envs<'a>(
     best
 }
 
-/// Deprecated: Use `get_envs` instead.
-///
-/// https://github.com/rustdesk/rustdesk/discussions/11959
-///
-/// **Note**: This function is retained for conservative migration. The plan is to gradually
-/// transition all callers to `get_envs` after it proves stable and reliable. Once `get_envs`
-/// is confirmed to work correctly across all use cases, this function will be removed entirely.
-///
-/// # Arguments
-/// * `name` - Environment variable name to retrieve
-/// * `uid` - User ID to filter processes
-/// * `process` - Process name pattern to match
-///
-/// # Returns
-/// The environment variable value, or empty string if not found
-#[inline]
-fn get_env(name: &str, uid: &str, process: &str) -> String {
-    let cmd = format!("ps -u {} -f | grep -E '{}' | grep -v 'grep' | tail -1 | awk '{{print $2}}' | xargs -I__ cat /proc/__/environ 2>/dev/null | tr '\\0' '\\n' | grep '^{}=' | tail -1 | sed 's/{}=//g'", uid, process, name, name);
-    if let Ok(x) = run_cmds(&cmd) {
-        x.trim_end().to_string()
-    } else {
-        "".to_owned()
+/// True when `pred` accepts the `/proc/<pid>/<file>` of any process, NULs turned into spaces,
+/// optionally only of processes owned by `uid`.
+/// Reads `/proc` directly instead of forking `ps` / `pgrep`, for the service-loop callers below.
+fn any_process<F: Fn(&str) -> bool>(uid: Option<u32>, file: &str, pred: F) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let proc_path = entry.path();
+        if let Some(uid) = uid {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata(&proc_path) {
+                Ok(meta) if meta.uid() == uid => {}
+                _ => continue,
+            }
+        }
+        let Ok(content) = std::fs::read(proc_path.join(file)) else {
+            continue;
+        };
+        if pred(&String::from_utf8_lossy(&content).replace('\0', " ")) {
+            return true;
+        }
     }
+    false
 }
 
 #[inline]
@@ -1837,13 +2101,17 @@ fn get_width_height_from_captures<'t>(caps: &Captures<'t>) -> Option<(i32, i32)>
 #[inline]
 fn get_xrandr_conn_pat(name: &str) -> String {
     format!(
-        r"{}\s+connected.+?(?P<width>\d+)x(?P<height>\d+)\+(?P<x>\d+)\+(?P<y>\d+).*?\n",
+        r"(?m)^{}\s+connected.+?(?P<width>\d+)x(?P<height>\d+)\+(?P<x>\d+)\+(?P<y>\d+).*?\n",
         name
     )
 }
 
+// The mode lines below an output. A mode name can have a suffix after its size, like the "i" of
+// "1920x1080i", so a TV's interlaced mode does not end the list.
+const XRANDR_MODES_PAT: &str = r"(?P<resolutions>(\s*\d+x\d+\S*\s+\d+.*\n)+)";
+
 pub fn resolutions(name: &str) -> Vec<Resolution> {
-    let resolutions_pat = r"(?P<resolutions>(\s*\d+x\d+\s+\d+.*\n)+)";
+    let resolutions_pat = XRANDR_MODES_PAT;
     let connected_pat = get_xrandr_conn_pat(name);
     let mut v = vec![];
     if let Ok(re) = Regex::new(&format!("{}{}", connected_pat, resolutions_pat)) {
@@ -1919,6 +2187,48 @@ pub fn current_resolution(name: &str) -> ResultType<Resolution> {
     bail!("Failed to find current resolution for {}", name);
 }
 
+#[cfg(test)]
+mod xrandr_tests {
+    use super::*;
+
+    #[test]
+    fn output_name_does_not_match_inside_another_name() {
+        let xrandr_output = "Screen 0: minimum 320 x 200, current 4480 x 1440, maximum 16384 x 16384
+eDP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 309mm x 174mm
+ 1920x1080 60.01*+ 59.97
+ 1280x720 60.00
+DP-1 connected 2560x1440+1920+0 (normal left inverted right x axis y axis) 597mm x 336mm
+ 2560x1440 59.95*+
+ 1920x1080 60.00
+";
+        let re = Regex::new(&get_xrandr_conn_pat("DP-1")).unwrap();
+        let caps = re.captures(xrandr_output).unwrap();
+        assert_eq!(get_width_height_from_captures(&caps), Some((2560, 1440)));
+    }
+
+    #[test]
+    fn interlaced_mode_does_not_end_the_mode_list() {
+        let xrandr_output =
+            "Screen 0: minimum 320 x 200, current 1920 x 1080, maximum 16384 x 16384
+HDMI-0 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 1600mm x 900mm
+ 1920x1080 60.00*+ 59.94 50.00
+ 1920x1080i 60.00 59.94 50.00
+ 1280x720 60.00 59.94 50.00
+ 640x480 75.00 59.94
+DP-0 disconnected (normal left inverted right x axis y axis)
+";
+        let re = Regex::new(&format!(
+            "{}{}",
+            get_xrandr_conn_pat("HDMI-0"),
+            XRANDR_MODES_PAT
+        ))
+        .unwrap();
+        let caps = re.captures(xrandr_output).unwrap();
+        assert!(caps["resolutions"].contains(" 1280x720 "));
+        assert!(caps["resolutions"].contains(" 640x480 "));
+    }
+}
+
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
     Command::new("xrandr")
         .args(vec![
@@ -1931,12 +2241,16 @@ pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> Re
     Ok(())
 }
 
+/// Scoped to `uid`, the user of the session being refreshed: the compositor starts Xwayland as
+/// that user, so another user's Xwayland -- a switched-away session, a second seat -- answering
+/// this used to route a pure-Wayland session into the Xwayland probe, which has no display for
+/// it to find. A uid that cannot be parsed falls back to the unscoped answer.
 #[inline]
-pub fn is_xwayland_running() -> bool {
-    if let Ok(output) = run_cmds("pgrep -a Xwayland") {
-        return output.contains("Xwayland");
-    }
-    false
+pub fn is_xwayland_running(uid: &str) -> bool {
+    // Same test as the `pgrep -a Xwayland` this replaces: the process name, not its command line.
+    any_process(uid.parse::<u32>().ok(), "comm", |comm| {
+        comm.contains("Xwayland")
+    })
 }
 
 mod desktop {
@@ -1959,10 +2273,14 @@ mod desktop {
 
     /// A compositor that runs Xwayland without exporting `XAUTHORITY` (wlroots, e.g. Hyprland)
     /// still hands out a usable session through the Wayland side. Requiring xauth there never
-    /// succeeded, so every refresh ran the retry loop to the end, 240 shell pipelines at a time.
+    /// succeeded, so every refresh ran the retry loop to the end.
     /// https://github.com/rustdesk/rustdesk/issues/15952
-    fn is_session_env_complete(display: &str, xauth: &str, wl_display: &str, dbus: &str) -> bool {
-        !display.is_empty() && (!xauth.is_empty() || (!wl_display.is_empty() && !dbus.is_empty()))
+    fn is_session_env_complete(envs: &std::collections::HashMap<&str, String>) -> bool {
+        let value = |key: &str| envs.get(key).map_or("", |v| v.as_str());
+        !value(ENV_KEY_DISPLAY).is_empty()
+            && (!value(ENV_KEY_XAUTHORITY).is_empty()
+                || (!value(ENV_KEY_WAYLAND_DISPLAY).is_empty()
+                    && !value(ENV_KEY_DBUS_SESSION_BUS_ADDRESS).is_empty()))
     }
 
     #[derive(Debug, Clone, Default)]
@@ -1976,6 +2294,9 @@ mod desktop {
         pub home: String,
         pub dbus: String,
         pub wl_display: String,
+        /// `Class=greeter` with `Type=tty`, see `is_wayland_tty_greeter`.
+        #[cfg(feature = "drm")]
+        tty_greeter: bool,
     }
 
     impl Desktop {
@@ -1986,7 +2307,34 @@ mod desktop {
 
         #[inline]
         pub fn is_login_wayland(&self) -> bool {
+            #[cfg(feature = "drm")]
+            if self.tty_greeter && self.is_wayland() {
+                return true;
+            }
             super::is_gdm_user(&self.username) && self.protocol == DISPLAY_SERVER_WAYLAND
+        }
+
+        /// The greeter's compositor creates its socket after logind has registered the session,
+        /// so a greeter first seen without one is asked again on every refresh until it has one.
+        /// Every compositor variable is dropped, not only the x11 values guessed meanwhile: going
+        /// straight from a user session to the greeter keeps that session's WAYLAND_DISPLAY and
+        /// bus here, and an endpoint the greeter `--server` is handed is never searched past.
+        /// A display server forced to x11 is the operator's answer, so it is left alone, as
+        /// `IS_X11` does; one forced to Wayland agrees with the socket and is adopted.
+        #[cfg(feature = "drm")]
+        fn adopt_wayland_tty_greeter(&mut self) {
+            if self.tty_greeter
+                && !self.is_wayland()
+                && std::env::var("RUSTDESK_FORCED_DISPLAY_SERVER").as_deref()
+                    != Ok(DISPLAY_SERVER_X11)
+                && super::has_wayland_socket(&self.uid)
+            {
+                self.protocol = DISPLAY_SERVER_WAYLAND.to_owned();
+                self.display.clear();
+                self.xauth.clear();
+                self.wl_display.clear();
+                self.dbus.clear();
+            }
         }
 
         fn get_display_xauth_wayland(&mut self) {
@@ -2037,17 +2385,33 @@ mod desktop {
                 self.dbus.clear();
                 let mut kept = 0u8;
                 for proc in display_proc {
-                    let display = get_env(ENV_KEY_DISPLAY, &self.uid, proc);
-                    let xauth = get_env(ENV_KEY_XAUTHORITY, &self.uid, proc);
-                    let wl_display = get_env(ENV_KEY_WAYLAND_DISPLAY, &self.uid, proc);
-                    let dbus = get_env(ENV_KEY_DBUS_SESSION_BUS_ADDRESS, &self.uid, proc);
-                    // Take a candidate whole and keep the best seen. Assigning each variable
-                    // unconditionally let a pattern that does not run on this desktop blank out
-                    // the values an earlier one had answered with, which is how a session with a
-                    // working portal ended up starting its `--server` with no compositor and no
-                    // bus at all. The Wayland-only rank is what a session whose Xwayland exports
-                    // no `XAUTHORITY` can still offer.
-                    let complete = is_session_env_complete(&display, &xauth, &wl_display, &dbus);
+                    let mut envs = get_envs_of_newest(
+                        &self.uid,
+                        proc,
+                        &[
+                            ENV_KEY_DISPLAY,
+                            ENV_KEY_XAUTHORITY,
+                            ENV_KEY_WAYLAND_DISPLAY,
+                            ENV_KEY_DBUS_SESSION_BUS_ADDRESS,
+                        ],
+                    );
+                    let complete = is_session_env_complete(&envs);
+                    let display = envs.remove(ENV_KEY_DISPLAY).unwrap_or_default();
+                    let xauth = envs.remove(ENV_KEY_XAUTHORITY).unwrap_or_default();
+                    let wl_display = envs.remove(ENV_KEY_WAYLAND_DISPLAY).unwrap_or_default();
+                    let dbus = envs
+                        .remove(ENV_KEY_DBUS_SESSION_BUS_ADDRESS)
+                        .unwrap_or_default();
+                    // Take a candidate whole. Two graphical sessions of one user each answer
+                    // some of these, and a display paired with another session's xauth or
+                    // compositor is a pair that never existed. So rank candidates rather than
+                    // merge them, and keep the best seen: the later patterns are fallbacks.
+                    //
+                    // The Wayland-only rank matters when `is_xwayland_running` matched some other
+                    // user's Xwayland and this session has none of its own. Nothing here can then
+                    // answer with a display, and dropping the candidate for that would leave the
+                    // child server without the compositor and bus of a session that is perfectly
+                    // serveable through them.
                     let rank = if complete {
                         3
                     } else if !wl_display.is_empty() && !dbus.is_empty() {
@@ -2091,7 +2455,9 @@ mod desktop {
                     SDDM_GREETER,
                 ];
                 for proc in display_proc {
-                    self.display = get_env(ENV_KEY_DISPLAY, &self.uid, proc);
+                    self.display = get_envs_of_newest(&self.uid, proc, &[ENV_KEY_DISPLAY])
+                        .remove(ENV_KEY_DISPLAY)
+                        .unwrap_or_default();
                     if !self.display.is_empty() {
                         break;
                     }
@@ -2222,7 +2588,9 @@ mod desktop {
                     tray.as_str(),
                 ];
                 for proc in display_proc {
-                    self.xauth = get_env("XAUTHORITY", &self.uid, proc);
+                    self.xauth = get_envs_of_newest(&self.uid, proc, &[ENV_KEY_XAUTHORITY])
+                        .remove(ENV_KEY_XAUTHORITY)
+                        .unwrap_or_default();
                     if !self.xauth.is_empty() {
                         break;
                     }
@@ -2305,10 +2673,22 @@ mod desktop {
             last
         }
 
+        /// Preserves an active seat0 session's cached identity so the service loop only retries
+        /// late Wayland display discovery instead of repeating the full seat lookup.
         pub fn refresh(&mut self) {
             if !self.sid.is_empty() && is_active_and_seat0(&self.sid) {
+                #[cfg(feature = "drm")]
+                if self.tty_greeter {
+                    self.adopt_wayland_tty_greeter();
+                    return;
+                }
                 // Xwayland display and xauth may not be available in a short time after login.
-                if is_xwayland_running() && !self.is_login_wayland() {
+                // Avoid scanning processes on X11, where Xwayland discovery cannot provide any
+                // useful session information.
+                if self.is_wayland()
+                    && !self.is_login_wayland()
+                    && is_xwayland_running(&self.uid)
+                {
                     self.get_display_xauth_xwayland();
                 } else if self.is_wayland() {
                     self.get_display_xauth_wayland();
@@ -2326,6 +2706,16 @@ mod desktop {
             self.uid = seat0_values[1].clone();
             self.username = seat0_values[2].clone();
             self.protocol = get_display_server_of_session(&self.sid).into();
+            #[cfg(feature = "drm")]
+            {
+                self.tty_greeter = super::is_tty_greeter_session(&self.sid);
+                if self.tty_greeter {
+                    // `Type=tty` names no display server, and the fallback above read this
+                    // service's own environment: only a compositor socket makes it Wayland.
+                    self.protocol = DISPLAY_SERVER_X11.to_owned();
+                }
+                self.adopt_wayland_tty_greeter();
+            }
             if self.is_login_wayland() {
                 self.display = "".to_owned();
                 self.xauth = "".to_owned();
@@ -2342,7 +2732,7 @@ mod desktop {
                 // greeter as `gdm-greeter`, which that helper does not match -- measured on the
                 // test host, where the greeter server therefore takes the branch below and gets a
                 // fully populated environment. This is for the display managers whose greeter user
-                // does match.
+                // does match, and for greetd's Wayland greeters (`adopt_wayland_tty_greeter`).
                 #[cfg(feature = "drm")]
                 self.get_home();
                 return;
@@ -2350,7 +2740,7 @@ mod desktop {
 
             self.get_home();
             if self.is_wayland() {
-                if is_xwayland_running() {
+                if is_xwayland_running(&self.uid) {
                     self.get_display_xauth_xwayland();
                 } else {
                     self.get_display_xauth_wayland();
@@ -2358,29 +2748,6 @@ mod desktop {
             } else {
                 self.get_display_x11();
                 self.get_xauth_x11();
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_desktop_env() {
-            let mut d = Desktop::default();
-            d.refresh();
-            if d.username == "root" {
-                assert_eq!(d.home, "/root");
-            } else {
-                if !d.username.is_empty() {
-                    let home = super::super::get_env_var("HOME");
-                    if !home.is_empty() {
-                        assert_eq!(d.home, home);
-                    } else {
-                        //
-                    }
-                }
             }
         }
     }
