@@ -1173,10 +1173,20 @@ fn process_software_update_check_response(bytes: Bytes) -> ResultType<()> {
     Ok(())
 }
 
+/// Flip to false to restore upstream behaviour. Dart twin: kXsdDisableUpdateCheck.
+pub const XSD_DISABLE_UPDATE_CHECK: bool = true;
+
 // No need to check `danger_accept_invalid_cert` for now.
 // Because the url is always `https://api.rustdesk.com/version/latest`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
+    // This is the only place that issues the version request, so gating here
+    // also covers the sciter UI, the flutter manual check and both callers in
+    // src/updater.rs. The request targets api.rustdesk.com no matter which
+    // rendezvous server the client is built against.
+    if XSD_DISABLE_UPDATE_CHECK {
+        return Ok(());
+    }
     let (request, url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
     let proxy_conf = Config::get_socks();

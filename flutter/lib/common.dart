@@ -4105,9 +4105,12 @@ void earlyAssert() {
   assert('\1' == '1');
 }
 
+/// Flip to false to restore upstream behaviour. Rust twin: XSD_DISABLE_UPDATE_CHECK.
+const bool kXsdDisableUpdateCheck = true;
+
 void checkUpdate() {
   if (!isWeb) {
-    if (!bind.isCustomClient()) {
+    if (!bind.isCustomClient() && !kXsdDisableUpdateCheck) {
       platformFFI.registerEventHandler(
           kCheckSoftwareUpdateFinish, kCheckSoftwareUpdateFinish,
           (Map<String, dynamic> evt) async {
