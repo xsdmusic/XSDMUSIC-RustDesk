@@ -13,8 +13,8 @@ jobs:
 
       - name: Backup current master
         run: |
-          git branch backup/pre-1.5.3-sync
-          git push origin backup/pre-1.5.3-sync
+          git branch backup/pre-1.5.3-sync HEAD
+          git push origin HEAD:refs/heads/backup/pre-1.5.3-sync
 
       - name: Merge upstream 1.5.3
         run: |
@@ -28,4 +28,4 @@ jobs:
             exit 1
           }
           git log --oneline -3
-          git push origin master
+          git push origin HEAD:master
