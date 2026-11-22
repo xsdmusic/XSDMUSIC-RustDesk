@@ -1,0 +1,31 @@
+name: Sync Upstream (temp)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Backup current master
+        run: |
+          git branch backup/pre-1.5.3-sync
+          git push origin backup/pre-1.5.3-sync
+
+      - name: Merge upstream 1.5.3
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/rustdesk/rustdesk.git
+          git fetch upstream tag 1.5.3 --no-tags
+          git merge 1.5.3 -X theirs -m "Sync upstream 1.5.3" || {
+            echo "::error::Merge conflicts, unmerged files:"
+            git diff --name-only --diff-filter=U
+            exit 1
+          }
+          git log --oneline -3
+          git push origin master
